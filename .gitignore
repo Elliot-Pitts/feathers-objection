@@ -27,7 +27,10 @@ node_modules
 # Users Environment Variables
 .lock-wscript
 
-lib/
+# lib/
+src/
+test/
+example/
 db.sqlite
 data.db
 
