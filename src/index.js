@@ -3,6 +3,7 @@ import filter from 'feathers-query-filters'
 import isPlainObject from 'is-plain-object'
 import errorHandler from './error-handler'
 import { errors } from 'feathers-errors'
+import {transaction} from 'objection'
 
 const METHODS = {
   $or: 'orWhere',
@@ -38,6 +39,7 @@ class Service {
     }
 
     this.options = options || {}
+    this.usesPg = options.usesPg || false
     this.id = options.id || 'id'
     this.paginate = options.paginate || {}
     this.events = options.events || []
@@ -45,6 +47,7 @@ class Service {
     this.allowedEager = options.allowedEager || '[]'
     this.namedEagerFilters = options.namedEagerFilters
     this.eagerFilters = options.eagerFilters
+    this.computedEagerFilters = options.computedEagerFilters
   }
 
   extend (obj) {
@@ -92,12 +95,29 @@ class Service {
     let q = this.Model.query().skipUndefined()
       .allowEager(this.allowedEager)
 
+    let eagerFilters = this.namedEagerFilters
+    if (this.computedEagerFilters && query.$eagerFilterParams) {
+      const paramEntries = Object.entries(query.$eagerFilterParams)
+      paramEntries.map(paramEntry => {
+        const eagerFilter = this.computedEagerFilters[paramEntry[0]]
+        if (eagerFilter) {
+          return [paramEntry[0], eagerFilter(paramEntry[1])]
+        }
+        return null
+      })
+        .filter(ef => ef)
+        .forEach(eagerFilter => {
+          eagerFilters[eagerFilter[0]] = eagerFilter[1];
+        });
+      delete query.$eagerFilterParams;
+    }
+
     // $eager for objection eager queries
     let $eager
     if (query && query.$eager) {
       $eager = query.$eager
       delete query.$eager
-      q.eager($eager, this.namedEagerFilters)
+      q.eager($eager, eagerFilters)
     }
 
     // $select uses a specific find syntax, so it has to come first.
@@ -105,7 +125,7 @@ class Service {
       q = this.Model.query().skipUndefined()
         .allowEager(this.allowedEager)
         .select(...filters.$select.concat(this.id))
-        .eager($eager, this.namedEagerFilters)
+        .eager($eager, eagerFilters)
     }
 
     // apply eager filters if specified
@@ -167,6 +187,7 @@ class Service {
         })
       }
     }
+    delete query.$eager
 
     if (count) {
       let countQuery = this.Model.query().skipUndefined().count(`${this.id} as total`)
@@ -219,24 +240,27 @@ class Service {
     return this._get(...args)
   }
 
-  _create (data, params) {
-    return this.Model.query().insert(data, this.id).then(row => {
-      const id = typeof data[this.id] !== 'undefined' ? data[this.id] : row[this.id]
-      return this._get(id, params)
-    }).catch(errorHandler)
+  async _create (data) {
+    let trx = await transaction.start(this.Model.knex())
+    try {
+      const result = await this.Model
+        .query(trx)
+        .insertGraph(data, this.id).returning('*');
+
+      await trx.commit();
+      return result;
+    } catch (error) {
+      trx.rollback();
+      errorHandler(error);
+    }
   }
 
   /**
    * `create` service function for objection.
    * @param {object} data
-   * @param {object} params
    */
-  create (data, params) {
-    if (Array.isArray(data)) {
-      return Promise.all(data.map(current => this._create(current, params)))
-    }
-
-    return this._create(data, params)
+  create (data) {
+    return this._create(data)
   }
 
   /**
