@@ -1,24 +1,33 @@
-import Proto from 'uberproto'
-import filter from 'feathers-query-filters'
-import isPlainObject from 'is-plain-object'
-import errorHandler from './error-handler'
-import { errors } from 'feathers-errors'
-import {transaction} from 'objection'
+import Proto from 'uberproto';
+import filter from 'feathers-query-filters';
+import isPlainObject from 'is-plain-object';
+import errorHandler from './error-handler';
+import { errors } from 'feathers-errors';
+const objection = require('objection');
 
 const METHODS = {
   $or: 'orWhere',
   $ne: 'whereNot',
   $in: 'whereIn',
-  $nin: 'whereNotIn'
-}
+  $nin: 'whereNotIn',
+};
 
 const OPERATORS = {
   $lt: '<',
   $lte: '<=',
   $gt: '>',
   $gte: '>=',
-  $like: 'like'
-}
+  $like: 'like',
+};
+
+const commitTransaction = async (trxOptions, knex) => {
+  await trxOptions.lastActionComplete;
+  const result = await objection.transaction(knex, async (trx) => {
+    const promises = trxOptions.actions.map(action => action(trx));
+    return Promise.all(promises);
+  });
+  trxOptions.trxResolver(result);
+};
 
 /**
  * Class representing an feathers adapter for objection.js ORM.
@@ -38,16 +47,17 @@ class Service {
       throw new Error('You must provide an Objection Model')
     }
 
-    this.options = options || {}
-    this.usesPg = options.usesPg || false
-    this.id = options.id || 'id'
-    this.paginate = options.paginate || {}
-    this.events = options.events || []
-    this.Model = options.model
-    this.allowedEager = options.allowedEager || '[]'
-    this.namedEagerFilters = options.namedEagerFilters
-    this.eagerFilters = options.eagerFilters
-    this.computedEagerFilters = options.computedEagerFilters
+    this.options = options || {};
+    this.usesPg = options.usesPg || false;
+    this.id = options.id || 'id';
+    this.paginate = options.paginate || {};
+    this.events = options.events || [];
+    this.Model = options.model;
+    this.Model.knex(options.knex);
+    this.allowedEager = options.allowedEager || '[]';
+    this.namedEagerFilters = options.namedEagerFilters;
+    this.eagerFilters = options.eagerFilters;
+    this.computedEagerFilters = options.computedEagerFilters;
   }
 
   extend (obj) {
@@ -85,7 +95,7 @@ class Service {
 
         return query[method].call(query, column, value) // eslint-disable-line no-useless-call
       }
-
+      console.log('lppoppo', column, operator, value)
       return query.where(column, operator, value)
     })
   }
@@ -217,18 +227,18 @@ class Service {
     return result
   }
 
-  _get (id, params) {
+  _get (id, params = {}) {
     const query = Object.assign({}, params.query)
     query[this.id] = id
 
     return this._find(Object.assign({}, params, { query }))
-    .then(page => {
-      if (page.data.length !== 1) {
-        throw new errors.NotFound(`No record found for id '${id}'`)
-      }
+      .then(page => {
+        if (page.data.length !== 1) {
+          throw new errors.NotFound(`No record found for id '${id}'`)
+        }
 
-      return page.data[0]
-    }).catch(errorHandler)
+        return page.data[0]
+      }).catch(errorHandler)
   }
 
   /**
@@ -240,27 +250,45 @@ class Service {
     return this._get(...args)
   }
 
-  async _create (data) {
-    let trx = await transaction.start(this.Model.knex())
-    try {
-      const result = await this.Model
-        .query(trx)
-        .insertGraph(data, this.id).returning('*');
-
-      await trx.commit();
-      return result;
-    } catch (error) {
-      trx.rollback();
-      errorHandler(error);
-    }
-  }
-
   /**
    * `create` service function for objection.
-   * @param {object} data
+   * @params {object} data
    */
-  create (data) {
-    return this._create(data)
+  async create (data, params) {
+
+    if (Array.isArray(data)) {
+      return errorHandler(new errors.BadRequest(`Can not batch create`));
+    }
+    try {
+      if (params.trx) {
+        const createFunc = async (trx) => {
+          return this.Model
+            .query(trx)
+            .insertGraph(data, this.id)
+            .returning('*');
+        };
+        const actionIndex = params.trx.actions.length;
+        params.trx.actions.push(createFunc);
+        if (params.trx.actions.length === params.trx.actionsCount) {
+          params.trx.lastActionResolver();
+        }
+        if (params.commitTrx) {
+          await commitTransaction(params.trx, this.Model.knex());
+        }
+        const trxResult = await params.trx.trxCommitted;
+        return trxResult[actionIndex];
+      }
+      else {
+        return await objection.transaction(this.Model.knex(), async (trx) => {
+          return await this.Model
+            .query(trx)
+            .insertGraph(data, this.id)
+            .returning('*');
+        });
+      }
+    } catch (error) {
+      errorHandler(new errors.BadRequest(error));
+    }
   }
 
   /**
@@ -302,57 +330,75 @@ class Service {
   /**
    * `patch` service function for objection.
    * @param id
-   * @param data
+   * @param raw
    * @param params
    */
-  patch (id, raw, params) {
-    const query = filter(params.query || {}).query
-    const data = Object.assign({}, raw)
-
-    const mapIds = page => page.data.map(current => current[this.id])
-
-    // By default we will just query for the one id. For multi patch
-    // we create a list of the ids of all items that will be changed
-    // to re-query them after the update
-    const ids = id === null ? this._find(params)
-      .then(mapIds) : Promise.resolve([ id ])
-
-    if (id !== null) {
+  async patch (id, raw, params) {
+    const query = filter(params.query || {}).query;
+    const data = Object.assign({}, raw);
+    if (data[this.id] != null) {
+      id = data[this.id]
+    }
+    if (id != null) {
       query[this.id] = id
     }
-
-    let q = this.Model.query()
-
-    this.objectify(q, query)
-
-    delete data[this.id]
-
-    return ids.then(idList => {
-      // Create a new query that re-queries all ids that
-      // were originally changed
-      const findParams = Object.assign({}, params, {
-        query: {
-          [this.id]: { $in: idList },
-          $select: params.query && params.query.$select
+    const $eager = query.$eager;
+    delete query.$eager;
+    delete data[this.id];
+    try {
+      let items;
+      if (params.trx) {
+        const patchFunc = async (trx) => {
+          let q = this.Model.query(trx)
+            .returning('*');
+          this.objectify(q, query);
+          return q.patch(data);
+        };
+        const actionIndex = params.trx.actions.length;
+        params.trx.actions.push(patchFunc);
+        if (params.trx.actions.length === params.trx.actionsCount) {
+          params.trx.lastActionResolver();
         }
-      })
-
-      return q.patch(data).then(() => {
-        return this._find(findParams).then(page => {
-          const items = page.data
-
-          if (id !== null) {
-            if (items.length === 1) {
-              return items[0]
-            } else {
-              throw new errors.NotFound(`No record found for id '${id}'`)
+        if (params.commitTrx) {
+          await commitTransaction(params.trx, this.Model.knex());
+        }
+        const trxResult = await params.trx.trxCommitted;
+        items = trxResult[actionIndex];
+      }
+      else {
+        let q = this.Model.query();
+        this.objectify(q, query);
+        items = await q.patch(data)
+          .returning('*');
+      }
+      if ($eager) {
+        let ids;
+        if (id) {
+          ids = [id];
+        } else {
+          ids = items.map(obj => obj[this.id]);
+        }
+        const page = await this.find({
+          query:
+            {
+              $eager,
+              [this.id]: {$in: ids},
             }
-          }
+        });
+        items = page.data;
+      }
+      if (id != null) {
+        if (items.length === 1) {
+          return items[0]
+        } else {
+          errorHandler(new errors.NotFound(`No record found for id '${id}'`))
+        }
+      }
+      return items;
 
-          return items
-        })
-      })
-    }).catch(errorHandler)
+    } catch (error) {
+      errorHandler(new errors.BadRequest(error));
+    }
   }
 
   /**
@@ -360,33 +406,52 @@ class Service {
    * @param id
    * @param params
    */
-  remove (id, params) {
-    params.query = params.query || {}
+  async remove (id, params) {
+    params.query = params.query || {};
 
     // NOTE (EK): First fetch the record so that we can return
     // it when we delete it.
     if (id !== null) {
       params.query[this.id] = id
     }
+    try {
+      let query;
+      const page = await this._find(params);
+      const items = page.data;
 
-    return this._find(params).then(page => {
-      const items = page.data
-      const query = this.Model.query()
-
-      this.objectify(query, params.query)
-
-      return query.delete().then(() => {
+      if (params.trx) {
+        console.log('DELETE-----------');
+        const deleteFunc = async (trx) => {
+          query = this.Model.query(trx);
+          this.objectify(query, params.query);
+          return query.delete();
+        };
+        const actionIndex = params.trx.actions.length;
+        params.trx.actions.push(deleteFunc);
+        if (params.trx.actions.length === params.trx.actionsCount) {
+          params.trx.lastActionResolver();
+        }
+        if (params.commitTrx) {
+          await commitTransaction(params.trx, this.Model.knex());
+        }
+        const trxResult = await params.trx.trxCommitted;
+        return trxResult[actionIndex];
+      } else {
+        query = this.Model.query();
+        this.objectify(query, params.query);
+        await query.delete();
         if (id !== null) {
           if (items.length === 1) {
             return items[0]
           } else {
-            throw new errors.NotFound(`No record found for id '${id}'`)
+            errorHandler(new errors.NotFound(`No record found for id '${id}'`));
           }
         }
-
         return items
-      })
-    }).catch(errorHandler)
+      }
+    } catch (err) {
+      errorHandler(new errors.BadRequest(err));
+    }
   }
 }
 
