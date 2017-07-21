@@ -3,7 +3,7 @@ import filter from 'feathers-query-filters';
 import isPlainObject from 'is-plain-object';
 import errorHandler from './error-handler';
 import { errors } from 'feathers-errors';
-const objection = require('objection');
+import objection from 'objection';
 
 const METHODS = {
   $or: 'orWhere',
